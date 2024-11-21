@@ -1,0 +1,246 @@
+import re
+import subprocess
+import time
+import cv2
+import torch
+from transformers import BartTokenizer, BartForConditionalGeneration
+from ultralytics import YOLO
+import pandas as pd
+from PIL import Image as PILImage
+from collections import deque
+
+# Paths and Model Initialization
+bart_folder_path = r"Downloads/fine-tuned-bart-tinder-20241112T084506Z-001/fine-tuned-bart-tinder"  # Path to BART folder
+tokenizer = BartTokenizer.from_pretrained(bart_folder_path)
+model = BartForConditionalGeneration.from_pretrained(bart_folder_path)
+device = "cuda" if torch.cuda.is_available() else "cpu"
+model.to(device)
+
+yolo_model = YOLO(r"C:\Users\E L I T E B O O K\Downloads\model_trained.pt")  # Path to YOLO model
+adb_path = r"F:\platform-tools\adb.exe"  # Path to adb executable
+
+# Global Variables
+is_app_open = False
+
+# ADB Command Helper
+
+def adb_command(command):
+    result = subprocess.run(command, shell=True, capture_output=True, text=True)
+    if result.returncode != 0:
+        print(f"ADB command failed: {result.stderr}")
+    return result.stdout.strip()
+
+# Bart with YOLO Functions
+
+def extract_actions(bart_output):
+    actions = []
+    open_app_match = re.search(r'{"action":\s*"<open_app>",\s*"command":\s*"(.*?)"}', bart_output)
+    if open_app_match:
+        open_app_command = open_app_match.group(1)
+        actions.append({"action": "open_app", "command": open_app_command})
+
+    label_match = re.search(r'"label":\s*"(.*?)"', bart_output)
+    if label_match:
+        icon_label = label_match.group(1).lower()
+        actions.append({"action": "detect_icon", "label": icon_label})
+    
+    return actions
+
+
+def process_command_with_actions(command):
+    normalized_command = command.lower().strip()
+    inputs = tokenizer(normalized_command, return_tensors="pt", truncation=True, max_length=128, padding="max_length").to(device)
+    
+    with torch.no_grad():
+        output_ids = model.generate(inputs["input_ids"], max_length=256, num_beams=4, early_stopping=True)
+    
+    bart_output = tokenizer.decode(output_ids[0], skip_special_tokens=True)
+    actions = extract_actions(bart_output)
+    return actions
+
+
+def execute_actions(actions):
+    global is_app_open
+    for action in actions:
+        if action['action'] == 'open_app':
+            subprocess.run(action['command'], shell=True)
+            is_app_open = True
+            time.sleep(5)
+        elif action['action'] == 'detect_icon':
+            coordinates = get_icon_coordinates(action['label'])
+            if coordinates:
+                tap(coordinates[0], coordinates[1], 1080, 2400)
+
+# YOLO and Screenshot Functions
+
+def take_screenshot(screenshot_path='screenshot.png'):
+    adb_command(f"{adb_path} shell screencap -p /sdcard/screenshot.png")
+    adb_command(f"{adb_path} pull /sdcard/screenshot.png {screenshot_path}")
+
+def take_screenshot_and_detect():
+    adb_command("adb exec-out screencap -p > screenshot.png")
+    image = cv2.imread("screenshot.png")
+    resized_image = cv2.resize(image, (640, 640))
+    results = yolo_model(resized_image)
+
+    if results and hasattr(results[0], 'boxes') and results[0].boxes is not None:
+        boxes = results[0].boxes.xyxy.cpu().numpy()
+        confidences = results[0].boxes.conf.cpu().numpy()
+        classes = results[0].boxes.cls.cpu().numpy()
+        data = [
+            [boxes[i][0], boxes[i][1], boxes[i][2], boxes[i][3], confidences[i], classes[i]]
+            for i in range(len(boxes))
+        ]
+        columns = ['xmin', 'ymin', 'xmax', 'ymax', 'confidence', 'class']
+        detections_df = pd.DataFrame(data, columns=columns)
+        detections_df['name'] = detections_df['class'].apply(lambda x: yolo_model.names[int(x)])
+        return detections_df
+    else:
+        return pd.DataFrame(columns=['xmin', 'ymin', 'xmax', 'ymax', 'confidence', 'class', 'name'])
+
+
+def tap(x, y, screen_width, screen_height):
+    normalized_x = int(x / 640 * screen_width)
+    normalized_y = int(y / 640 * screen_height)
+    adb_command(f"adb shell input tap {normalized_x} {normalized_y}")
+    time.sleep(1)
+
+
+def get_icon_coordinates(icon_name):
+    detections = take_screenshot_and_detect()
+    icon_detections = detections[detections['name'] == icon_name]
+    if not icon_detections.empty:
+        x_center = (icon_detections.iloc[0]['xmin'] + icon_detections.iloc[0]['xmax']) / 2
+        y_center = (icon_detections.iloc[0]['ymin'] + icon_detections.iloc[0]['ymax']) / 2
+        return x_center, y_center
+    else:
+        print(f"Icon '{icon_name}' not found.")
+        return None
+
+# Wander Mode Functions
+
+def dfs_traverse(icon_stack, screen_width, screen_height):
+    visited = set()
+    while icon_stack:
+        icon, coordinates = icon_stack.pop()
+        if icon in visited:
+            continue
+        visited.add(icon)
+        print(f"Visiting: {icon}")
+        tap(*coordinates, screen_width, screen_height)
+        time.sleep(1)
+
+        if icon == 'home':
+            scenario_home(screen_width, screen_height)
+        elif icon == 'explore':
+            scenario_explore(screen_width, screen_height)
+        elif icon == 'gold_home':
+            scenario_gold_home(screen_width, screen_height)
+        elif icon == 'profile':
+            scenario_profile(screen_width, screen_height)
+
+        back_coordinates = get_icon_coordinates('back')
+        if back_coordinates:
+            tap(*back_coordinates, screen_width, screen_height)
+
+
+def scenario_home(screen_width, screen_height):
+    print("Executing 'home' scenario in wander mode")
+    structure = {
+        'notifications': ['back'],
+        'settings': ['back'],
+        'user_profile': ['dislike', 'super_like', 'boost', 'profile_back'],
+        'rewind': ['close'],
+        'dislike': [],
+        'super_like': ['close'],
+        'like': [],
+        'boost': ['close']
+    }
+    for icon, children in structure.items():
+        print(f"Tapping {icon}")
+        coordinates = get_icon_coordinates(icon)
+        if coordinates:
+            tap(*coordinates, screen_width, screen_height)
+            for child in children:
+                child_coordinates = get_icon_coordinates(child)
+                if child_coordinates:
+                    tap(*child_coordinates, screen_width, screen_height)
+            if icon in ['notifications', 'settings', 'user_profile']:
+                back_coordinates = get_icon_coordinates('back')
+                if back_coordinates:
+                    tap(*back_coordinates, screen_width, screen_height)
+
+
+def scenario_explore(screen_width, screen_height):
+    print("Executing 'explore' scenario")
+    categories = ['long_termpartner', 'short_termfun', 'new_friends', 'travel', 'binge_watchers', 'sporty', 'date_night']
+    for category in categories:
+        coordinates = get_icon_coordinates(category)
+        if coordinates:
+            tap(*coordinates, screen_width, screen_height)
+            back_coordinates = get_icon_coordinates('close')
+            if back_coordinates:
+                tap(*back_coordinates, screen_width, screen_height)
+
+
+def scenario_gold_home(screen_width, screen_height):
+    print("Executing 'gold_home' scenario")
+    icons = ['top_picks', '0_likes', 'who_likes', 'close']
+    for icon in icons:
+        coordinates = get_icon_coordinates(icon)
+        if coordinates:
+            tap(*coordinates, screen_width, screen_height)
+
+
+def scenario_profile(screen_width, screen_height):
+    print("Executing 'profile' scenario")
+    structure = {
+        'profile_setting': ['back'],
+        'safety_centre': ['guides', 'tools', 'close'],
+        'edit_profile': ['back']
+    }
+    for icon, children in structure.items():
+        coordinates = get_icon_coordinates(icon)
+        if coordinates:
+            tap(*coordinates, screen_width, screen_height)
+            for child in children:
+                child_coordinates = get_icon_coordinates(child)
+                if child_coordinates:
+                    tap(*child_coordinates, screen_width, screen_height)
+
+# Open App Function for Wander Mode
+
+def open_app(package_name="com.tinder"):
+    print(f"Opening app with package: {package_name}")
+    adb_command(f"adb shell monkey -p {package_name} -c android.intent.category.LAUNCHER 1")
+    time.sleep(5)
+
+# Main Selection Loop
+
+def main():
+    print("Select mode:")
+    print("1. Bart with YOLO")
+    print("2. Wander Mode")
+    
+    choice = input("Enter your choice (1 or 2): ")
+    
+    if choice == '1':
+        while True:
+            command = input("Enter your command (or type 'exit' to quit): ")
+            if command.lower() == 'exit':
+                break
+            actions = process_command_with_actions(command)
+            execute_actions(actions)
+    elif choice == '2':
+        open_app()
+        screen_width, screen_height = 1080, 2400
+        icon_stack = deque()
+        detections = take_screenshot_and_detect()
+        for _, row in detections.iterrows():
+            icon_stack.append((row['name'], ((row['xmin'] + row['xmax']) / 2, (row['ymin'] + row['ymax']) / 2)))
+        dfs_traverse(icon_stack, screen_width, screen_height)
+    else:
+        print("Invalid choice. Exiting.")
+
+if __name__ == "__main__":
+    main()
